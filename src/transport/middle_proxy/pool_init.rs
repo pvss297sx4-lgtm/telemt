@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -27,20 +27,14 @@ impl MePool {
 
         for family in family_order {
             let map = self.proxy_map_for_family(family).await;
-            let mut grouped_dc_addrs: HashMap<i32, Vec<(IpAddr, u16)>> = HashMap::new();
-            for (dc, addrs) in map {
-                if addrs.is_empty() {
-                    continue;
-                }
-                grouped_dc_addrs.entry(dc.abs()).or_default().extend(addrs);
-            }
-            let mut dc_addrs: Vec<(i32, Vec<(IpAddr, u16)>)> = grouped_dc_addrs
+            let mut dc_addrs: Vec<(i32, Vec<(IpAddr, u16)>)> = map
                 .into_iter()
                 .map(|(dc, mut addrs)| {
                     addrs.sort_unstable();
                     addrs.dedup();
                     (dc, addrs)
                 })
+                .filter(|(_, addrs)| !addrs.is_empty())
                 .collect();
             dc_addrs.sort_unstable_by_key(|(dc, _)| *dc);
             dc_addrs.sort_by_key(|(_, addrs)| (addrs.len() != 1, addrs.len()));

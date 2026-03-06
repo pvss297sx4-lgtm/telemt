@@ -273,13 +273,12 @@ impl ConnRegistry {
             bound_clients_by_writer.insert(*writer_id, conn_ids.len());
         }
         for conn_meta in inner.meta.values() {
-            let dc_u16 = conn_meta.target_dc.unsigned_abs();
-            if dc_u16 == 0 {
+            if conn_meta.target_dc == 0 {
                 continue;
             }
-            if let Ok(dc) = i16::try_from(dc_u16) {
-                *active_sessions_by_target_dc.entry(dc).or_insert(0) += 1;
-            }
+            *active_sessions_by_target_dc
+                .entry(conn_meta.target_dc)
+                .or_insert(0) += 1;
         }
 
         WriterActivitySnapshot {
@@ -402,7 +401,8 @@ mod tests {
         let snapshot = registry.writer_activity_snapshot().await;
         assert_eq!(snapshot.bound_clients_by_writer.get(&10), Some(&2));
         assert_eq!(snapshot.bound_clients_by_writer.get(&20), Some(&1));
-        assert_eq!(snapshot.active_sessions_by_target_dc.get(&2), Some(&2));
+        assert_eq!(snapshot.active_sessions_by_target_dc.get(&2), Some(&1));
+        assert_eq!(snapshot.active_sessions_by_target_dc.get(&-2), Some(&1));
         assert_eq!(snapshot.active_sessions_by_target_dc.get(&4), Some(&1));
     }
 }
