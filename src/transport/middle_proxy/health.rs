@@ -60,6 +60,7 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
     loop {
         tokio::time::sleep(Duration::from_secs(HEALTH_INTERVAL_SECS)).await;
         pool.prune_closed_writers().await;
+        reap_draining_writers(&pool).await;
         check_family(
             IpFamily::V4,
             &pool,
@@ -92,6 +93,28 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
             &mut adaptive_recover_until,
         )
         .await;
+    }
+}
+
+async fn reap_draining_writers(pool: &Arc<MePool>) {
+    let now_epoch_secs = MePool::now_epoch_secs();
+    let writers = pool.writers.read().await.clone();
+    for writer in writers {
+        if !writer.draining.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        if pool.registry.is_writer_empty(writer.id).await {
+            pool.remove_writer_and_close_clients(writer.id).await;
+            continue;
+        }
+        let deadline_epoch_secs = writer
+            .drain_deadline_epoch_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if deadline_epoch_secs != 0 && now_epoch_secs >= deadline_epoch_secs {
+            warn!(writer_id = writer.id, "Drain timeout, force-closing");
+            pool.stats.increment_pool_force_close_total();
+            pool.remove_writer_and_close_clients(writer.id).await;
+        }
     }
 }
 
@@ -153,12 +176,18 @@ async fn check_family(
             .push(writer.id);
     }
     let writer_idle_since = pool.registry.writer_idle_since_snapshot().await;
+    let bound_clients_by_writer = pool
+        .registry
+        .writer_activity_snapshot()
+        .await
+        .bound_clients_by_writer;
     let floor_plan = build_family_floor_plan(
         pool,
         family,
         &dc_endpoints,
         &live_addr_counts,
         &live_writer_ids_by_addr,
+        &bound_clients_by_writer,
         adaptive_idle_since,
         adaptive_recover_until,
     )
@@ -241,6 +270,7 @@ async fn check_family(
                 required,
                 &live_writer_ids_by_addr,
                 &writer_idle_since,
+                &bound_clients_by_writer,
                 idle_refresh_next_attempt,
             )
             .await;
@@ -254,6 +284,7 @@ async fn check_family(
                 alive,
                 required,
                 &live_writer_ids_by_addr,
+                &bound_clients_by_writer,
                 shadow_rotate_deadline,
             )
             .await;
@@ -320,6 +351,7 @@ async fn check_family(
                     &endpoints,
                     &live_writer_ids_by_addr,
                     &writer_idle_since,
+                    &bound_clients_by_writer,
                 )
                 .await;
                 if swapped {
@@ -470,6 +502,7 @@ async fn build_family_floor_plan(
     dc_endpoints: &HashMap<i32, Vec<SocketAddr>>,
     live_addr_counts: &HashMap<SocketAddr, usize>,
     live_writer_ids_by_addr: &HashMap<SocketAddr, Vec<u64>>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
     adaptive_idle_since: &mut HashMap<(i32, IpFamily), Instant>,
     adaptive_recover_until: &mut HashMap<(i32, IpFamily), Instant>,
 ) -> FamilyFloorPlan {
@@ -491,6 +524,7 @@ async fn build_family_floor_plan(
             key,
             endpoints,
             live_writer_ids_by_addr,
+            bound_clients_by_writer,
             adaptive_idle_since,
             adaptive_recover_until,
         )
@@ -521,7 +555,7 @@ async fn build_family_floor_plan(
             .sum::<usize>();
         family_active_total = family_active_total.saturating_add(alive);
         let writer_ids = list_writer_ids_for_endpoints(endpoints, live_writer_ids_by_addr);
-        let has_bound_clients = has_bound_clients_on_endpoint(pool, &writer_ids).await;
+        let has_bound_clients = has_bound_clients_on_endpoint(&writer_ids, bound_clients_by_writer);
 
         entries.push(DcFloorPlanEntry {
             dc: *dc,
@@ -622,6 +656,7 @@ async fn maybe_swap_idle_writer_for_cap(
     endpoints: &[SocketAddr],
     live_writer_ids_by_addr: &HashMap<SocketAddr, Vec<u64>>,
     writer_idle_since: &HashMap<u64, u64>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
 ) -> bool {
     let now_epoch_secs = MePool::now_epoch_secs();
     let mut candidate: Option<(u64, SocketAddr, u64)> = None;
@@ -630,7 +665,7 @@ async fn maybe_swap_idle_writer_for_cap(
             continue;
         };
         for writer_id in writer_ids {
-            if !pool.registry.is_writer_empty(*writer_id).await {
+            if bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) > 0 {
                 continue;
             }
             let Some(idle_since_epoch_secs) = writer_idle_since.get(writer_id).copied() else {
@@ -705,6 +740,7 @@ async fn maybe_refresh_idle_writer_for_dc(
     required: usize,
     live_writer_ids_by_addr: &HashMap<SocketAddr, Vec<u64>>,
     writer_idle_since: &HashMap<u64, u64>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
     idle_refresh_next_attempt: &mut HashMap<(i32, IpFamily), Instant>,
 ) {
     if alive < required {
@@ -725,6 +761,9 @@ async fn maybe_refresh_idle_writer_for_dc(
             continue;
         };
         for writer_id in writer_ids {
+            if bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) > 0 {
+                continue;
+            }
             let Some(idle_since_epoch_secs) = writer_idle_since.get(writer_id).copied() else {
                 continue;
             };
@@ -806,6 +845,7 @@ async fn should_reduce_floor_for_idle(
     key: (i32, IpFamily),
     endpoints: &[SocketAddr],
     live_writer_ids_by_addr: &HashMap<SocketAddr, Vec<u64>>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
     adaptive_idle_since: &mut HashMap<(i32, IpFamily), Instant>,
     adaptive_recover_until: &mut HashMap<(i32, IpFamily), Instant>,
 ) -> bool {
@@ -817,7 +857,7 @@ async fn should_reduce_floor_for_idle(
 
     let now = Instant::now();
     let writer_ids = list_writer_ids_for_endpoints(endpoints, live_writer_ids_by_addr);
-    let has_bound_clients = has_bound_clients_on_endpoint(pool, &writer_ids).await;
+    let has_bound_clients = has_bound_clients_on_endpoint(&writer_ids, bound_clients_by_writer);
     if has_bound_clients {
         adaptive_idle_since.remove(&key);
         adaptive_recover_until.insert(key, now + pool.adaptive_floor_recover_grace_duration());
@@ -836,13 +876,13 @@ async fn should_reduce_floor_for_idle(
     now.saturating_duration_since(*idle_since) >= pool.adaptive_floor_idle_duration()
 }
 
-async fn has_bound_clients_on_endpoint(pool: &Arc<MePool>, writer_ids: &[u64]) -> bool {
-    for writer_id in writer_ids {
-        if !pool.registry.is_writer_empty(*writer_id).await {
-            return true;
-        }
-    }
-    false
+fn has_bound_clients_on_endpoint(
+    writer_ids: &[u64],
+    bound_clients_by_writer: &HashMap<u64, usize>,
+) -> bool {
+    writer_ids
+        .iter()
+        .any(|writer_id| bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) > 0)
 }
 
 async fn recover_single_endpoint_outage(
@@ -973,6 +1013,7 @@ async fn maybe_rotate_single_endpoint_shadow(
     alive: usize,
     required: usize,
     live_writer_ids_by_addr: &HashMap<SocketAddr, Vec<u64>>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
     shadow_rotate_deadline: &mut HashMap<(i32, IpFamily), Instant>,
 ) {
     if endpoints.len() != 1 || alive < required {
@@ -1011,7 +1052,7 @@ async fn maybe_rotate_single_endpoint_shadow(
 
     let mut candidate_writer_id = None;
     for writer_id in writer_ids {
-        if pool.registry.is_writer_empty(*writer_id).await {
+        if bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) == 0 {
             candidate_writer_id = Some(*writer_id);
             break;
         }

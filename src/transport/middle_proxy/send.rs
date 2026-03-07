@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
@@ -59,6 +60,7 @@ impl MePool {
         let mut hybrid_recovery_round = 0u32;
         let mut hybrid_last_recovery_at: Option<Instant> = None;
         let hybrid_wait_step = self.me_route_no_writer_wait.max(Duration::from_millis(50));
+        let mut hybrid_wait_current = hybrid_wait_step;
 
         loop {
             if let Some(current) = self.registry.get_writer(conn_id).await {
@@ -147,11 +149,14 @@ impl MePool {
                                 target_dc,
                                 &mut hybrid_recovery_round,
                                 &mut hybrid_last_recovery_at,
-                                hybrid_wait_step,
+                                hybrid_wait_current,
                             )
                             .await;
-                            let deadline = Instant::now() + hybrid_wait_step;
+                            let deadline = Instant::now() + hybrid_wait_current;
                             let _ = self.wait_for_writer_until(deadline).await;
+                            hybrid_wait_current =
+                                (hybrid_wait_current.saturating_mul(2))
+                                    .min(Duration::from_millis(400));
                             continue;
                         }
                     }
@@ -223,16 +228,26 @@ impl MePool {
                             target_dc,
                             &mut hybrid_recovery_round,
                             &mut hybrid_last_recovery_at,
-                            hybrid_wait_step,
+                            hybrid_wait_current,
                         )
                         .await;
-                        let deadline = Instant::now() + hybrid_wait_step;
+                        let deadline = Instant::now() + hybrid_wait_current;
                         let _ = self.wait_for_candidate_until(target_dc, deadline).await;
+                        hybrid_wait_current = (hybrid_wait_current.saturating_mul(2))
+                            .min(Duration::from_millis(400));
                         continue;
                     }
                 }
             }
-            let writer_idle_since = self.registry.writer_idle_since_snapshot().await;
+            hybrid_wait_current = hybrid_wait_step;
+            let writer_ids: Vec<u64> = candidate_indices
+                .iter()
+                .map(|idx| writers_snapshot[*idx].id)
+                .collect();
+            let writer_idle_since = self
+                .registry
+                .writer_idle_since_for_writer_ids(&writer_ids)
+                .await;
             let now_epoch_secs = Self::now_epoch_secs();
 
             if self.me_deterministic_writer_sort.load(Ordering::Relaxed) {
@@ -507,7 +522,11 @@ impl MePool {
             let mut p = Vec::with_capacity(12);
             p.extend_from_slice(&RPC_CLOSE_EXT_U32.to_le_bytes());
             p.extend_from_slice(&conn_id.to_le_bytes());
-            if w.tx.send(WriterCommand::DataAndFlush(p)).await.is_err() {
+            if w.tx
+                .send(WriterCommand::DataAndFlush(Bytes::from(p)))
+                .await
+                .is_err()
+            {
                 debug!("ME close write failed");
                 self.remove_writer_and_close_clients(w.writer_id).await;
             }
@@ -524,7 +543,7 @@ impl MePool {
             let mut p = Vec::with_capacity(12);
             p.extend_from_slice(&RPC_CLOSE_CONN_U32.to_le_bytes());
             p.extend_from_slice(&conn_id.to_le_bytes());
-            match w.tx.try_send(WriterCommand::DataAndFlush(p)) {
+            match w.tx.try_send(WriterCommand::DataAndFlush(Bytes::from(p))) {
                 Ok(()) => {}
                 Err(TrySendError::Full(cmd)) => {
                     let _ = tokio::time::timeout(Duration::from_millis(50), w.tx.send(cmd)).await;
