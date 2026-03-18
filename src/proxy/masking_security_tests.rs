@@ -318,6 +318,254 @@ async fn backend_reachable_fast_response_waits_mask_outcome_budget() {
 }
 
 #[tokio::test]
+async fn proxy_header_write_error_on_tcp_path_still_honors_coarse_outcome_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let probe = b"GET /proxy-hdr-err HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec();
+
+    let accept_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+
+    let mut config = ProxyConfig::default();
+    config.general.beobachten = false;
+    config.censorship.mask = true;
+    config.censorship.mask_host = Some("127.0.0.1".to_string());
+    config.censorship.mask_port = backend_addr.port();
+    config.censorship.mask_unix_sock = None;
+    config.censorship.mask_proxy_protocol = 1;
+
+    let peer: SocketAddr = "203.0.113.88:42430".parse().unwrap();
+    let local_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+    let (client_reader_side, client_reader) = duplex(256);
+    drop(client_reader_side);
+    let (_client_visible_reader, client_visible_writer) = duplex(512);
+    let beobachten = BeobachtenStore::new();
+
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        handle_bad_client(
+            client_reader,
+            client_visible_writer,
+            &probe,
+            peer,
+            local_addr,
+            &config,
+            &beobachten,
+        )
+        .await;
+    });
+
+    timeout(Duration::from_millis(35), task)
+        .await
+        .expect_err("proxy-header write error path should remain inside coarse masking budget window");
+    assert!(
+        started.elapsed() >= Duration::from_millis(35),
+        "proxy-header write error path should avoid immediate-return timing signature"
+    );
+
+    accept_task.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proxy_header_write_error_on_unix_path_still_honors_coarse_outcome_budget() {
+    let sock_path = format!(
+        "/tmp/telemt-mask-unix-hdr-err-{}-{}.sock",
+        std::process::id(),
+        rand::random::<u64>()
+    );
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let probe = b"GET /unix-hdr-err HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec();
+
+    let accept_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+
+    let mut config = ProxyConfig::default();
+    config.general.beobachten = false;
+    config.censorship.mask = true;
+    config.censorship.mask_unix_sock = Some(sock_path.clone());
+    config.censorship.mask_proxy_protocol = 1;
+
+    let peer: SocketAddr = "203.0.113.89:42431".parse().unwrap();
+    let local_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+    let (client_reader_side, client_reader) = duplex(256);
+    drop(client_reader_side);
+    let (_client_visible_reader, client_visible_writer) = duplex(512);
+    let beobachten = BeobachtenStore::new();
+
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        handle_bad_client(
+            client_reader,
+            client_visible_writer,
+            &probe,
+            peer,
+            local_addr,
+            &config,
+            &beobachten,
+        )
+        .await;
+    });
+
+    timeout(Duration::from_millis(35), task)
+        .await
+        .expect_err("unix proxy-header write error path should remain inside coarse masking budget window");
+    assert!(
+        started.elapsed() >= Duration::from_millis(35),
+        "unix proxy-header write error path should avoid immediate-return timing signature"
+    );
+
+    accept_task.await.unwrap();
+    let _ = std::fs::remove_file(sock_path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_socket_proxy_protocol_v1_header_is_sent_before_probe() {
+    let sock_path = format!(
+        "/tmp/telemt-mask-unix-v1-{}-{}.sock",
+        std::process::id(),
+        rand::random::<u64>()
+    );
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let probe = b"GET /unix-v1 HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec();
+    let backend_reply = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+    let accept_task = tokio::spawn({
+        let probe = probe.clone();
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let mut header_line = Vec::new();
+            reader.read_until(b'\n', &mut header_line).await.unwrap();
+            let header_text = String::from_utf8(header_line).unwrap();
+            assert!(header_text.starts_with("PROXY "), "must start with PROXY prefix");
+            assert!(header_text.ends_with("\r\n"), "v1 header must end with CRLF");
+
+            let mut received_probe = vec![0u8; probe.len()];
+            reader.read_exact(&mut received_probe).await.unwrap();
+            assert_eq!(received_probe, probe);
+
+            let mut stream = reader.into_inner();
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut config = ProxyConfig::default();
+    config.general.beobachten = false;
+    config.censorship.mask = true;
+    config.censorship.mask_unix_sock = Some(sock_path.clone());
+    config.censorship.mask_proxy_protocol = 1;
+
+    let peer: SocketAddr = "203.0.113.51:51010".parse().unwrap();
+    let local_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+    let (client_reader, _client_writer) = duplex(256);
+    let (mut client_visible_reader, client_visible_writer) = duplex(2048);
+
+    let beobachten = BeobachtenStore::new();
+    handle_bad_client(
+        client_reader,
+        client_visible_writer,
+        &probe,
+        peer,
+        local_addr,
+        &config,
+        &beobachten,
+    )
+    .await;
+
+    let mut observed = vec![0u8; backend_reply.len()];
+    client_visible_reader.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    accept_task.await.unwrap();
+    let _ = std::fs::remove_file(sock_path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_socket_proxy_protocol_v2_header_is_sent_before_probe() {
+    let sock_path = format!(
+        "/tmp/telemt-mask-unix-v2-{}-{}.sock",
+        std::process::id(),
+        rand::random::<u64>()
+    );
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let probe = b"GET /unix-v2 HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec();
+    let backend_reply = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+    let accept_task = tokio::spawn({
+        let probe = probe.clone();
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let mut sig = [0u8; 12];
+            stream.read_exact(&mut sig).await.unwrap();
+            assert_eq!(&sig, b"\r\n\r\n\0\r\nQUIT\n", "v2 signature must match spec");
+
+            let mut fixed = [0u8; 4];
+            stream.read_exact(&mut fixed).await.unwrap();
+            let addr_len = u16::from_be_bytes([fixed[2], fixed[3]]) as usize;
+            let mut addr_block = vec![0u8; addr_len];
+            stream.read_exact(&mut addr_block).await.unwrap();
+
+            let mut received_probe = vec![0u8; probe.len()];
+            stream.read_exact(&mut received_probe).await.unwrap();
+            assert_eq!(received_probe, probe);
+
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut config = ProxyConfig::default();
+    config.general.beobachten = false;
+    config.censorship.mask = true;
+    config.censorship.mask_unix_sock = Some(sock_path.clone());
+    config.censorship.mask_proxy_protocol = 2;
+
+    let peer: SocketAddr = "203.0.113.52:51011".parse().unwrap();
+    let local_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+    let (client_reader, _client_writer) = duplex(256);
+    let (mut client_visible_reader, client_visible_writer) = duplex(2048);
+
+    let beobachten = BeobachtenStore::new();
+    handle_bad_client(
+        client_reader,
+        client_visible_writer,
+        &probe,
+        peer,
+        local_addr,
+        &config,
+        &beobachten,
+    )
+    .await;
+
+    let mut observed = vec![0u8; backend_reply.len()];
+    client_visible_reader.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    accept_task.await.unwrap();
+    let _ = std::fs::remove_file(sock_path);
+}
+
+#[tokio::test]
 async fn mask_disabled_fast_eof_not_shaped_by_mask_budget() {
     let mut config = ProxyConfig::default();
     config.general.beobachten = false;

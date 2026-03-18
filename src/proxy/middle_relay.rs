@@ -44,6 +44,10 @@ const C2ME_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 const C2ME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
+#[cfg(test)]
+const QUOTA_USER_LOCKS_MAX: usize = 64;
+#[cfg(not(test))]
+const QUOTA_USER_LOCKS_MAX: usize = 4_096;
 static DESYNC_DEDUP: OnceLock<DashMap<u64, Instant>> = OnceLock::new();
 static DESYNC_HASHER: OnceLock<RandomState> = OnceLock::new();
 static DESYNC_FULL_CACHE_LAST_EMIT_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
@@ -336,6 +340,14 @@ fn quota_user_lock(user: &str) -> Arc<AsyncMutex<()>> {
         return Arc::clone(existing.value());
     }
 
+    if locks.len() >= QUOTA_USER_LOCKS_MAX {
+        locks.retain(|_, value| Arc::strong_count(value) > 1);
+    }
+
+    if locks.len() >= QUOTA_USER_LOCKS_MAX {
+        return Arc::new(AsyncMutex::new(()));
+    }
+
     let created = Arc::new(AsyncMutex::new(()));
     match locks.entry(user.to_string()) {
         dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -405,7 +417,7 @@ where
     );
 
     let (conn_id, me_rx) = me_pool.registry().register().await;
-    let trace_id = conn_id;
+    let trace_id = session_id;
     let bytes_me2c = Arc::new(AtomicU64::new(0));
     let mut forensics = RelayForensicsState {
         trace_id,

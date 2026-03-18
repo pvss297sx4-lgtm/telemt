@@ -31,6 +31,22 @@ use std::os::unix::fs::OpenOptionsExt;
 
 const UNKNOWN_DC_LOG_DISTINCT_LIMIT: usize = 1024;
 static LOGGED_UNKNOWN_DCS: OnceLock<Mutex<HashSet<i16>>> = OnceLock::new();
+const MAX_SCOPE_HINT_LEN: usize = 64;
+
+fn validated_scope_hint(user: &str) -> Option<&str> {
+    let scope = user.strip_prefix("scope_")?;
+    if scope.is_empty() || scope.len() > MAX_SCOPE_HINT_LEN {
+        return None;
+    }
+    if scope
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        Some(scope)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone)]
 struct SanitizedUnknownDcLogPath {
@@ -185,8 +201,15 @@ where
         "Connecting to Telegram DC"
     );
 
+    let scope_hint = validated_scope_hint(user);
+    if user.starts_with("scope_") && scope_hint.is_none() {
+        warn!(
+            user = %user,
+            "Ignoring invalid scope hint and falling back to default upstream selection"
+        );
+    }
     let tg_stream = upstream_manager
-        .connect(dc_addr, Some(success.dc_idx), user.strip_prefix("scope_").filter(|s| !s.is_empty()))
+        .connect(dc_addr, Some(success.dc_idx), scope_hint)
         .await?;
 
     debug!(peer = %success.peer, dc_addr = %dc_addr, "Connected, performing TG handshake");
@@ -290,17 +313,18 @@ fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
         warn!(dc_idx = dc_idx, "Requested non-standard DC with no override; falling back to default cluster");
         if config.general.unknown_dc_file_log_enabled
             && let Some(path) = &config.general.unknown_dc_log_path
-            && should_log_unknown_dc(dc_idx)
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
             if let Some(path) = sanitize_unknown_dc_log_path(path) {
-                handle.spawn_blocking(move || {
-                    if unknown_dc_log_path_is_still_safe(&path)
-                        && let Ok(mut file) = open_unknown_dc_log_append(&path.resolved_path)
-                    {
-                        let _ = writeln!(file, "dc_idx={dc_idx}");
-                    }
-                });
+                if should_log_unknown_dc(dc_idx) {
+                    handle.spawn_blocking(move || {
+                        if unknown_dc_log_path_is_still_safe(&path)
+                            && let Ok(mut file) = open_unknown_dc_log_append(&path.resolved_path)
+                        {
+                            let _ = writeln!(file, "dc_idx={dc_idx}");
+                        }
+                    });
+                }
             } else {
                 warn!(dc_idx = dc_idx, raw_path = %path, "Rejected unsafe unknown DC log path");
             }

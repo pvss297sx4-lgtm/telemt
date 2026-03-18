@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
+use tokio::sync::Barrier;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::duplex;
 use tokio::time::{Duration as TokioDuration, timeout};
 
@@ -230,6 +232,219 @@ fn desync_dedup_cache_is_bounded() {
     assert!(
         !should_emit_full_desync(u64::MAX, false, now),
         "already tracked key inside dedup window must stay suppressed"
+    );
+}
+
+#[test]
+fn quota_user_lock_cache_reuses_entry_for_same_user() {
+    let a = quota_user_lock("quota-user-a");
+    let b = quota_user_lock("quota-user-a");
+    assert!(Arc::ptr_eq(&a, &b), "same user must reuse same quota lock");
+}
+
+#[test]
+fn quota_user_lock_cache_is_bounded_under_unique_churn() {
+    let map = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
+    map.clear();
+
+    for idx in 0..(QUOTA_USER_LOCKS_MAX + 128) {
+        let user = format!("quota-user-{idx}");
+        let lock = quota_user_lock(&user);
+        drop(lock);
+    }
+
+    assert!(
+        map.len() <= QUOTA_USER_LOCKS_MAX,
+        "quota lock cache must stay within configured bound"
+    );
+}
+
+#[test]
+fn quota_user_lock_cache_saturation_returns_ephemeral_lock_without_growth() {
+    let map = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
+    map.clear();
+
+    let mut retained = Vec::with_capacity(QUOTA_USER_LOCKS_MAX);
+    for idx in 0..QUOTA_USER_LOCKS_MAX {
+        let user = format!("quota-held-user-{idx}");
+        retained.push(quota_user_lock(&user));
+    }
+
+    assert_eq!(
+        map.len(),
+        QUOTA_USER_LOCKS_MAX,
+        "precondition: cache should be full before overflow acquisition"
+    );
+
+    let overflow_a = quota_user_lock("quota-overflow-user");
+    let overflow_b = quota_user_lock("quota-overflow-user");
+
+    assert_eq!(
+        map.len(),
+        QUOTA_USER_LOCKS_MAX,
+        "overflow acquisition must not grow cache past hard limit"
+    );
+    assert!(
+        map.get("quota-overflow-user").is_none(),
+        "overflow path should not cache new user lock when map is saturated and all entries are retained"
+    );
+    assert!(
+        !Arc::ptr_eq(&overflow_a, &overflow_b),
+        "overflow user lock should be ephemeral under saturation to preserve bounded cache size"
+    );
+
+    drop(retained);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adversarial_quota_race_under_lock_cache_saturation_still_allows_only_one_winner() {
+    let map = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
+    map.clear();
+
+    let mut retained = Vec::with_capacity(QUOTA_USER_LOCKS_MAX);
+    for idx in 0..QUOTA_USER_LOCKS_MAX {
+        let user = format!("quota-saturated-user-{idx}");
+        retained.push(quota_user_lock(&user));
+    }
+
+    assert_eq!(
+        map.len(),
+        QUOTA_USER_LOCKS_MAX,
+        "precondition: cache must be saturated for overflow-user race test"
+    );
+
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+    let user = "gap-t04-saturated-lock-race-user";
+    let barrier = Arc::new(Barrier::new(2));
+
+    let one = run_quota_race_attempt(&stats, &bytes_me2c, user, 0x55, 9101, barrier.clone());
+    let two = run_quota_race_attempt(&stats, &bytes_me2c, user, 0x66, 9102, barrier);
+    let (r1, r2) = tokio::join!(one, two);
+
+    assert!(
+        matches!(r1, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. }))
+            && matches!(r2, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. })),
+        "both racers must resolve cleanly without unexpected errors"
+    );
+    assert!(
+        matches!(r1, Err(ProxyError::DataQuotaExceeded { .. }))
+            || matches!(r2, Err(ProxyError::DataQuotaExceeded { .. })),
+        "at least one racer must be quota-rejected even when lock cache is saturated"
+    );
+    assert_eq!(
+        stats.get_user_total_octets(user),
+        1,
+        "saturated lock cache must not permit double-success quota overshoot"
+    );
+
+    drop(retained);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stress_quota_race_under_lock_cache_saturation_never_allows_double_success() {
+    let map = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
+    map.clear();
+
+    let mut retained = Vec::with_capacity(QUOTA_USER_LOCKS_MAX);
+    for idx in 0..QUOTA_USER_LOCKS_MAX {
+        let user = format!("quota-saturated-stress-holder-{idx}");
+        retained.push(quota_user_lock(&user));
+    }
+
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+
+    for round in 0..128u64 {
+        let user = format!("gap-t04-saturated-race-round-{round}");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let one = run_quota_race_attempt(
+            &stats,
+            &bytes_me2c,
+            &user,
+            0x71,
+            12_000 + round,
+            barrier.clone(),
+        );
+        let two = run_quota_race_attempt(
+            &stats,
+            &bytes_me2c,
+            &user,
+            0x72,
+            13_000 + round,
+            barrier,
+        );
+
+        let (r1, r2) = tokio::join!(one, two);
+        assert!(
+            matches!(r1, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. }))
+                && matches!(r2, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. })),
+            "round {round}: racers must resolve cleanly"
+        );
+        assert!(
+            matches!(r1, Err(ProxyError::DataQuotaExceeded { .. }))
+                || matches!(r2, Err(ProxyError::DataQuotaExceeded { .. })),
+            "round {round}: at least one racer must be quota-rejected"
+        );
+        assert_eq!(
+            stats.get_user_total_octets(&user),
+            1,
+            "round {round}: saturated cache must still enforce exactly one forwarded byte"
+        );
+    }
+
+    drop(retained);
+}
+
+#[test]
+fn adversarial_forensics_trace_id_should_not_alias_conn_id() {
+    let now = Instant::now();
+    let trace_id = 0x1122_3344_5566_7788;
+    let conn_id = 0x8877_6655_4433_2211;
+    let state = RelayForensicsState {
+        trace_id,
+        conn_id,
+        user: "trace-user".to_string(),
+        peer: "198.51.100.17:443".parse().unwrap(),
+        peer_hash: 0x8877_6655_4433_2211,
+        started_at: now,
+        bytes_c2me: 0,
+        bytes_me2c: Arc::new(AtomicU64::new(0)),
+        desync_all_full: false,
+    };
+
+    assert_ne!(
+        state.trace_id, state.conn_id,
+        "security expectation: trace correlation should be independent of connection identity"
+    );
+    assert_eq!(state.trace_id, trace_id);
+    assert_eq!(state.conn_id, conn_id);
+}
+
+#[tokio::test]
+async fn abridged_ack_uses_big_endian_confirm_bytes_after_decryption() {
+    let (mut writer_side, reader_side) = duplex(8);
+    let key = [0u8; 32];
+    let iv = 0u128;
+    let mut writer = CryptoWriter::new(reader_side, AesCtr::new(&key, iv), 8 * 1024);
+
+    write_client_ack(&mut writer, ProtoTag::Abridged, 0x11_22_33_44)
+        .await
+        .expect("ack write must succeed");
+
+    let mut observed = [0u8; 4];
+    writer_side
+        .read_exact(&mut observed)
+        .await
+        .expect("ack bytes must be readable");
+    let mut decryptor = AesCtr::new(&key, iv);
+    let decrypted = decryptor.decrypt(&observed);
+
+    assert_eq!(
+        decrypted,
+        0x11_22_33_44u32.to_be_bytes(),
+        "abridged ACK should encode confirm bytes in big-endian order"
     );
 }
 
@@ -1705,6 +1920,150 @@ async fn middle_relay_cutover_midflight_releases_route_gauge() {
     );
 
     drop(client_side);
+}
+
+async fn run_quota_race_attempt(
+    stats: &Stats,
+    bytes_me2c: &AtomicU64,
+    user: &str,
+    payload: u8,
+    conn_id: u64,
+    barrier: Arc<Barrier>,
+) -> Result<MeWriterResponseOutcome> {
+    let (writer_side, _reader_side) = duplex(1024);
+    let mut writer = make_crypto_writer(writer_side);
+    let rng = SecureRandom::new();
+    let mut frame_buf = Vec::new();
+
+    barrier.wait().await;
+    process_me_writer_response(
+        MeResponse::Data {
+            flags: 0,
+            data: Bytes::from(vec![payload]),
+        },
+        &mut writer,
+        ProtoTag::Intermediate,
+        &rng,
+        &mut frame_buf,
+        stats,
+        user,
+        Some(1),
+        bytes_me2c,
+        conn_id,
+        false,
+        false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn abridged_max_extended_length_fails_closed_without_panic_or_partial_read() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("middle relay test lock must be available");
+
+    let (reader, mut writer) = duplex(256);
+    let mut crypto_reader = make_crypto_reader(reader);
+    let buffer_pool = Arc::new(BufferPool::new());
+    let stats = Stats::new();
+    let forensics = make_forensics_state();
+    let mut frame_counter = 0;
+
+    let plaintext = vec![0x7f, 0xff, 0xff, 0xff];
+    let encrypted = encrypt_for_reader(&plaintext);
+    writer.write_all(&encrypted).await.unwrap();
+
+    let result = read_client_payload(
+        &mut crypto_reader,
+        ProtoTag::Abridged,
+        4096,
+        TokioDuration::from_secs(1),
+        &buffer_pool,
+        &forensics,
+        &mut frame_counter,
+        &stats,
+    )
+    .await;
+
+    assert!(result.is_err(), "oversized abridged length must fail closed");
+    assert_eq!(frame_counter, 0, "oversized frame must not be counted as accepted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deterministic_quota_race_exactly_one_succeeds_and_one_is_rejected() {
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+    let user = "gap-t04-race-user";
+    let barrier = Arc::new(Barrier::new(2));
+
+    let f1 = run_quota_race_attempt(&stats, &bytes_me2c, user, 0x11, 5001, barrier.clone());
+    let f2 = run_quota_race_attempt(&stats, &bytes_me2c, user, 0x22, 5002, barrier);
+
+    let (r1, r2) = tokio::join!(f1, f2);
+
+    assert!(
+        matches!(r1, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. })),
+        "first racer must either finish or fail closed on quota"
+    );
+    assert!(
+        matches!(r2, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. })),
+        "second racer must either finish or fail closed on quota"
+    );
+    assert!(
+        matches!(r1, Err(ProxyError::DataQuotaExceeded { .. }))
+            || matches!(r2, Err(ProxyError::DataQuotaExceeded { .. })),
+        "at least one racer must be quota-rejected"
+    );
+    assert_eq!(
+        stats.get_user_total_octets(user),
+        1,
+        "same-user race must forward/account exactly one payload byte"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stress_quota_race_bursts_never_allow_double_success_per_round() {
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+
+    for round in 0..128u64 {
+        let user = format!("gap-t04-race-burst-{round}");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let one = run_quota_race_attempt(
+            &stats,
+            &bytes_me2c,
+            &user,
+            0x33,
+            6000 + round,
+            barrier.clone(),
+        );
+        let two = run_quota_race_attempt(
+            &stats,
+            &bytes_me2c,
+            &user,
+            0x44,
+            7000 + round,
+            barrier,
+        );
+
+        let (r1, r2) = tokio::join!(one, two);
+        assert!(
+            matches!(r1, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. }))
+                && matches!(r2, Ok(_) | Err(ProxyError::DataQuotaExceeded { .. })),
+            "round {round}: racers must resolve cleanly without unexpected errors"
+        );
+        assert!(
+            matches!(r1, Err(ProxyError::DataQuotaExceeded { .. }))
+                || matches!(r2, Err(ProxyError::DataQuotaExceeded { .. })),
+            "round {round}: at least one racer must be quota-rejected"
+        );
+        assert_eq!(
+            stats.get_user_total_octets(&user),
+            1,
+            "round {round}: same-user total octets must remain exactly 1 (single forwarded winner)"
+        );
+    }
 }
 
 #[tokio::test]

@@ -300,7 +300,7 @@ where
                     handle_bad_client(
                         reader,
                         writer,
-                        &mtproto_handshake,
+                        &handshake,
                         real_peer,
                         local_addr,
                         &config,
@@ -713,7 +713,7 @@ impl RunningClientHandler {
                 handle_bad_client(
                     reader,
                     writer,
-                    &mtproto_handshake,
+                    &handshake,
                     peer,
                     local_addr,
                     &config,

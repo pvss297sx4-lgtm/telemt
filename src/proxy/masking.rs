@@ -181,6 +181,7 @@ where
                 };
                 if let Some(header) = proxy_header {
                     if !write_proxy_header_with_timeout(&mut mask_write, &header).await {
+                        wait_mask_outcome_budget(outcome_started).await;
                         return;
                     }
                 }
@@ -246,6 +247,7 @@ where
             let (mask_read, mut mask_write) = stream.into_split();
             if let Some(header) = proxy_header {
                 if !write_proxy_header_with_timeout(&mut mask_write, &header).await {
+                    wait_mask_outcome_budget(outcome_started).await;
                     return;
                 }
             }

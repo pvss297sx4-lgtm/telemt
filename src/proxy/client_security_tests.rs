@@ -5,8 +5,8 @@ use crate::crypto::sha256_hmac;
 use crate::protocol::constants::ProtoTag;
 use crate::protocol::tls;
 use crate::proxy::handshake::HandshakeSuccess;
-use crate::transport::proxy_protocol::ProxyProtocolV1Builder;
 use crate::stream::{CryptoReader, CryptoWriter};
+use crate::transport::proxy_protocol::ProxyProtocolV1Builder;
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -301,6 +301,333 @@ async fn relay_cutover_releases_user_gate_and_ip_reservation() {
     drop(client_side);
     tg_accept_task.abort();
     let _ = tg_accept_task.await;
+}
+
+#[tokio::test]
+async fn integration_route_cutover_and_quota_overlap_fails_closed_and_releases_state() {
+    let tg_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tg_addr = tg_listener.local_addr().unwrap();
+
+    let tg_accept_task = tokio::spawn(async move {
+        let (mut stream, _) = tg_listener.accept().await.unwrap();
+        stream.write_all(&[0x41, 0x42]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    let user = "cutover-quota-overlap-user";
+    let peer_addr: SocketAddr = "198.51.100.240:50010".parse().unwrap();
+
+    let stats = Arc::new(Stats::new());
+    let ip_tracker = Arc::new(UserIpTracker::new());
+
+    let mut cfg = ProxyConfig::default();
+    cfg.access.user_max_tcp_conns.insert(user.to_string(), 8);
+    cfg.access.user_data_quota.insert(user.to_string(), 1);
+    cfg.dc_overrides
+        .insert("2".to_string(), vec![tg_addr.to_string()]);
+    let config = Arc::new(cfg);
+
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+
+    let (server_side, client_side) = duplex(64 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_side);
+    let client_reader = make_crypto_reader(server_reader);
+    let client_writer = make_crypto_writer(server_writer);
+
+    let success = HandshakeSuccess {
+        user: user.to_string(),
+        dc_idx: 2,
+        proto_tag: ProtoTag::Intermediate,
+        dec_key: [0u8; 32],
+        dec_iv: 0,
+        enc_key: [0u8; 32],
+        enc_iv: 0,
+        peer: peer_addr,
+        is_tls: false,
+    };
+
+    let relay_task = tokio::spawn(RunningClientHandler::handle_authenticated_static(
+        client_reader,
+        client_writer,
+        success,
+        upstream_manager,
+        stats.clone(),
+        config,
+        buffer_pool,
+        rng,
+        None,
+        route_runtime.clone(),
+        "127.0.0.1:443".parse().unwrap(),
+        peer_addr,
+        ip_tracker.clone(),
+    ));
+
+    let observed_progress = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if stats.get_user_curr_connects(user) >= 1
+                || ip_tracker.get_active_ip_count(user).await >= 1
+                || relay_task.is_finished()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        observed_progress,
+        "overlap race test precondition must observe activation or bounded early termination"
+    );
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let _ = route_runtime.set_mode(RelayRouteMode::Middle);
+
+    let relay_result = tokio::time::timeout(Duration::from_secs(3), relay_task)
+        .await
+        .expect("overlap race relay must terminate")
+        .expect("overlap race relay task must not panic");
+
+    assert!(
+        matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. }))
+            || matches!(relay_result, Err(ProxyError::Proxy(ref msg)) if msg == crate::proxy::route_mode::ROUTE_SWITCH_ERROR_MSG),
+        "overlap race must fail closed via quota enforcement or generic cutover termination"
+    );
+
+    assert_eq!(
+        stats.get_user_curr_connects(user),
+        0,
+        "overlap race exit must release user current-connection slot"
+    );
+    assert_eq!(
+        ip_tracker.get_active_ip_count(user).await,
+        0,
+        "overlap race exit must release reserved user IP footprint"
+    );
+
+    drop(client_side);
+    tg_accept_task.abort();
+    let _ = tg_accept_task.await;
+}
+
+#[tokio::test]
+async fn stress_drop_without_release_converges_to_zero_user_and_ip_state() {
+    let user = "gap-t05-drop-stress-user";
+    let mut config = crate::config::ProxyConfig::default();
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), 4096);
+
+    let stats = std::sync::Arc::new(crate::stats::Stats::new());
+    let ip_tracker = std::sync::Arc::new(crate::ip_tracker::UserIpTracker::new());
+
+    let mut reservations = Vec::new();
+    for idx in 0..512u16 {
+        let peer = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, (idx >> 8) as u8, (idx & 0xff) as u8)),
+            30_000 + idx,
+        );
+        let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+            user,
+            &config,
+            stats.clone(),
+            peer,
+            ip_tracker.clone(),
+        )
+        .await
+        .expect("reservation acquisition must succeed in stress precondition");
+        reservations.push(reservation);
+    }
+
+    assert_eq!(stats.get_user_curr_connects(user), 512);
+
+    for reservation in reservations {
+        std::thread::spawn(move || drop(reservation))
+            .join()
+            .expect("drop thread must not panic");
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if stats.get_user_curr_connects(user) == 0
+                && ip_tracker.get_active_ip_count(user).await == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("drop-only path must eventually release all user/IP reservations");
+}
+
+#[tokio::test]
+async fn proxy_protocol_header_is_rejected_when_trust_list_is_empty() {
+    let mut cfg = crate::config::ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.server.proxy_protocol_trusted_cidrs.clear();
+
+    let config = std::sync::Arc::new(cfg);
+    let stats = std::sync::Arc::new(crate::stats::Stats::new());
+    let upstream_manager = std::sync::Arc::new(crate::transport::UpstreamManager::new(
+        vec![crate::config::UpstreamConfig {
+            upstream_type: crate::config::UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = std::sync::Arc::new(crate::stats::ReplayChecker::new(128, std::time::Duration::from_secs(60)));
+    let buffer_pool = std::sync::Arc::new(crate::stream::BufferPool::new());
+    let rng = std::sync::Arc::new(crate::crypto::SecureRandom::new());
+    let route_runtime = std::sync::Arc::new(crate::proxy::route_mode::RouteRuntimeController::new(crate::proxy::route_mode::RelayRouteMode::Direct));
+    let ip_tracker = std::sync::Arc::new(crate::ip_tracker::UserIpTracker::new());
+    let beobachten = std::sync::Arc::new(crate::stats::beobachten::BeobachtenStore::new());
+
+    let (server_side, mut client_side) = duplex(2048);
+    let peer: std::net::SocketAddr = "198.51.100.80:55000".parse().unwrap();
+
+    let handler = tokio::spawn(handle_client_stream(
+        server_side,
+        peer,
+        config,
+        stats,
+        upstream_manager,
+        replay_checker,
+        buffer_pool,
+        rng,
+        None,
+        route_runtime,
+        None,
+        ip_tracker,
+        beobachten,
+        true,
+    ));
+
+    let proxy_header = ProxyProtocolV1Builder::new()
+        .tcp4(
+            "203.0.113.9:32000".parse().unwrap(),
+            "192.0.2.8:443".parse().unwrap(),
+        )
+        .build();
+    client_side.write_all(&proxy_header).await.unwrap();
+    drop(client_side);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), handler)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(ProxyError::InvalidProxyProtocol)));
+}
+
+#[tokio::test]
+async fn proxy_protocol_header_from_untrusted_peer_range_is_rejected_under_load() {
+    let mut cfg = crate::config::ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.server.proxy_protocol_trusted_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
+
+    let config = std::sync::Arc::new(cfg);
+
+    for idx in 0..32u16 {
+        let stats = std::sync::Arc::new(crate::stats::Stats::new());
+        let upstream_manager = std::sync::Arc::new(crate::transport::UpstreamManager::new(
+            vec![crate::config::UpstreamConfig {
+                upstream_type: crate::config::UpstreamType::Direct {
+                    interface: None,
+                    bind_addresses: None,
+                },
+                weight: 1,
+                enabled: true,
+                scopes: String::new(),
+                selected_scope: String::new(),
+            }],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        ));
+        let replay_checker = std::sync::Arc::new(crate::stats::ReplayChecker::new(64, std::time::Duration::from_secs(60)));
+        let buffer_pool = std::sync::Arc::new(crate::stream::BufferPool::new());
+        let rng = std::sync::Arc::new(crate::crypto::SecureRandom::new());
+        let route_runtime = std::sync::Arc::new(crate::proxy::route_mode::RouteRuntimeController::new(crate::proxy::route_mode::RelayRouteMode::Direct));
+        let ip_tracker = std::sync::Arc::new(crate::ip_tracker::UserIpTracker::new());
+        let beobachten = std::sync::Arc::new(crate::stats::beobachten::BeobachtenStore::new());
+
+        let (server_side, mut client_side) = duplex(1024);
+        let peer = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, (idx + 1) as u8)),
+            55_000 + idx,
+        );
+
+        let handler = tokio::spawn(handle_client_stream(
+            server_side,
+            peer,
+            config.clone(),
+            stats,
+            upstream_manager,
+            replay_checker,
+            buffer_pool,
+            rng,
+            None,
+            route_runtime,
+            None,
+            ip_tracker,
+            beobachten,
+            true,
+        ));
+
+        let proxy_header = ProxyProtocolV1Builder::new()
+            .tcp4(
+                "203.0.113.10:32000".parse().unwrap(),
+                "192.0.2.8:443".parse().unwrap(),
+            )
+            .build();
+        client_side.write_all(&proxy_header).await.unwrap();
+        drop(client_side);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(ProxyError::InvalidProxyProtocol)),
+            "burst idx {idx}: untrusted source must be rejected"
+        );
+    }
 }
 
 #[tokio::test]
@@ -888,7 +1215,7 @@ async fn valid_tls_path_does_not_fall_back_to_mask_backend() {
     let ip_tracker = Arc::new(UserIpTracker::new());
     let beobachten = Arc::new(BeobachtenStore::new());
 
-    let (server_side, mut client_side) = duplex(8192);
+    let (server_side, mut client_side) = duplex(131072);
     let peer: SocketAddr = "198.51.100.80:55002".parse().unwrap();
     let stats_for_assert = stats.clone();
     let bad_before = stats_for_assert.get_connects_bad();
@@ -947,11 +1274,12 @@ async fn valid_tls_with_invalid_mtproto_falls_back_to_mask_backend() {
     let invalid_mtproto = vec![0u8; crate::protocol::constants::HANDSHAKE_LEN];
     let tls_app_record = wrap_tls_application_data(&invalid_mtproto);
 
+    let expected_fallback = client_hello.clone();
     let accept_task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut got = vec![0u8; invalid_mtproto.len()];
+        let mut got = vec![0u8; expected_fallback.len()];
         stream.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, invalid_mtproto);
+        assert_eq!(got, expected_fallback);
     });
 
     let mut cfg = ProxyConfig::default();
@@ -1045,11 +1373,12 @@ async fn client_handler_tls_bad_mtproto_is_forwarded_to_mask_backend() {
     let invalid_mtproto = vec![0u8; crate::protocol::constants::HANDSHAKE_LEN];
     let tls_app_record = wrap_tls_application_data(&invalid_mtproto);
 
+    let expected_fallback = client_hello.clone();
     let mask_accept_task = tokio::spawn(async move {
         let (mut stream, _) = mask_listener.accept().await.unwrap();
-        let mut got = vec![0u8; invalid_mtproto.len()];
+        let mut got = vec![0u8; expected_fallback.len()];
         stream.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, invalid_mtproto);
+        assert_eq!(got, expected_fallback);
     });
 
     let mut cfg = ProxyConfig::default();

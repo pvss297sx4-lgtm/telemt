@@ -14,6 +14,176 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
+#[derive(Default)]
+struct WakeCounter {
+    wakes: AtomicUsize,
+}
+
+impl std::task::Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[tokio::test]
+async fn quota_lock_contention_does_not_self_wake_pending_writer() {
+    let stats = Arc::new(Stats::new());
+    let user = "quota-lock-contention-user";
+
+    let lock = super::quota_user_lock(user);
+    let _held_lock = lock
+        .try_lock()
+        .expect("test must hold the per-user quota lock before polling writer");
+
+    let counters = Arc::new(super::SharedCounters::new());
+    let quota_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut io = super::StatsIo::new(
+        tokio::io::sink(),
+        counters,
+        Arc::clone(&stats),
+        user.to_string(),
+        Some(1024),
+        quota_exceeded,
+        tokio::time::Instant::now(),
+    );
+
+    let wake_counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&wake_counter));
+    let mut cx = Context::from_waker(&waker);
+
+    let poll = Pin::new(&mut io).poll_write(&mut cx, &[0x11]);
+    assert!(poll.is_pending(), "writer must remain pending while lock is contended");
+    assert_eq!(
+        wake_counter.wakes.load(Ordering::Relaxed),
+        0,
+        "contended quota lock must not self-wake immediately and spin the executor"
+    );
+}
+
+#[tokio::test]
+async fn quota_lock_contention_writer_schedules_single_deferred_wake_until_lock_acquired() {
+    let stats = Arc::new(Stats::new());
+    let user = "quota-lock-writer-liveness-user";
+
+    let lock = super::quota_user_lock(user);
+    let held_lock = lock
+        .try_lock()
+        .expect("test must hold the per-user quota lock before polling writer");
+
+    let counters = Arc::new(super::SharedCounters::new());
+    let quota_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut io = super::StatsIo::new(
+        tokio::io::sink(),
+        counters,
+        Arc::clone(&stats),
+        user.to_string(),
+        Some(1024),
+        quota_exceeded,
+        tokio::time::Instant::now(),
+    );
+
+    let wake_counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&wake_counter));
+    let mut cx = Context::from_waker(&waker);
+
+    let first = Pin::new(&mut io).poll_write(&mut cx, &[0x11]);
+    assert!(first.is_pending(), "writer must remain pending while lock is contended");
+    assert_eq!(
+        wake_counter.wakes.load(Ordering::Relaxed),
+        0,
+        "deferred wake must not fire synchronously"
+    );
+
+    timeout(Duration::from_millis(50), async {
+        loop {
+            if wake_counter.wakes.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("contended writer must schedule a deferred wake in bounded time");
+    let wakes_after_first_yield = wake_counter.wakes.load(Ordering::Relaxed);
+    assert!(
+        wakes_after_first_yield >= 1,
+        "contended writer must schedule at least one deferred wake for liveness"
+    );
+
+    let second = Pin::new(&mut io).poll_write(&mut cx, &[0x22]);
+    assert!(second.is_pending(), "writer remains pending while lock is still held");
+
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        wake_counter.wakes.load(Ordering::Relaxed),
+        wakes_after_first_yield,
+        "writer contention should not schedule unbounded wake storms before lock acquisition"
+    );
+
+    drop(held_lock);
+    let released = Pin::new(&mut io).poll_write(&mut cx, &[0x33]);
+    assert!(released.is_ready(), "writer must make progress once quota lock is released");
+}
+
+#[tokio::test]
+async fn quota_lock_contention_read_path_schedules_deferred_wake_for_liveness() {
+    let stats = Arc::new(Stats::new());
+    let user = "quota-lock-read-liveness-user";
+
+    let lock = super::quota_user_lock(user);
+    let held_lock = lock
+        .try_lock()
+        .expect("test must hold the per-user quota lock before polling reader");
+
+    let counters = Arc::new(super::SharedCounters::new());
+    let quota_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut io = super::StatsIo::new(
+        tokio::io::empty(),
+        counters,
+        Arc::clone(&stats),
+        user.to_string(),
+        Some(1024),
+        quota_exceeded,
+        tokio::time::Instant::now(),
+    );
+
+    let wake_counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&wake_counter));
+    let mut cx = Context::from_waker(&waker);
+    let mut storage = [0u8; 1];
+    let mut buf = ReadBuf::new(&mut storage);
+
+    let first = Pin::new(&mut io).poll_read(&mut cx, &mut buf);
+    assert!(first.is_pending(), "reader must remain pending while lock is contended");
+    assert_eq!(
+        wake_counter.wakes.load(Ordering::Relaxed),
+        0,
+        "read contention wake must not fire synchronously"
+    );
+
+    timeout(Duration::from_millis(50), async {
+        loop {
+            if wake_counter.wakes.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("read contention must schedule a deferred wake in bounded time");
+
+    drop(held_lock);
+    let mut buf_after_release = ReadBuf::new(&mut storage);
+    let released = Pin::new(&mut io).poll_read(&mut cx, &mut buf_after_release);
+    assert!(released.is_ready(), "reader must make progress once quota lock is released");
+}
+
 #[tokio::test]
 async fn relay_bidirectional_enforces_live_user_quota() {
     let stats = Arc::new(Stats::new());

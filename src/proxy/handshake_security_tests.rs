@@ -1345,6 +1345,29 @@ fn invalid_secret_warning_keys_do_not_collide_on_colon_boundaries() {
     );
 }
 
+#[test]
+fn invalid_secret_warning_cache_is_bounded() {
+    let _guard = warned_secrets_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_warned_secrets_for_testing();
+
+    for idx in 0..(WARNED_SECRET_MAX_ENTRIES + 32) {
+        let user = format!("warned_user_{idx}");
+        warn_invalid_secret_once(&user, "invalid_length", ACCESS_SECRET_BYTES, Some(idx));
+    }
+
+    let warned = INVALID_SECRET_WARNED
+        .get()
+        .expect("warned set must be initialized");
+    let guard = warned.lock().expect("warned set lock must be available");
+    assert_eq!(
+        guard.len(),
+        WARNED_SECRET_MAX_ENTRIES,
+        "invalid-secret warning cache must remain bounded"
+    );
+}
+
 #[tokio::test]
 async fn repeated_invalid_tls_probes_trigger_pre_auth_throttle() {
     let _guard = auth_probe_test_lock()
@@ -1921,6 +1944,165 @@ fn auth_probe_eviction_offset_changes_with_time_component() {
     );
 }
 
+
+#[test]
+fn auth_probe_round_limited_overcap_eviction_marks_saturation_and_keeps_newcomer_trackable() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let now = Instant::now();
+    let initial = AUTH_PROBE_TRACK_MAX_ENTRIES + 64;
+
+    let sentinel = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250));
+    state.insert(
+        sentinel,
+        AuthProbeState {
+            fail_streak: 25,
+            blocked_until: now,
+            last_seen: now - Duration::from_secs(30),
+        },
+    );
+
+    for idx in 0..(initial - 1) {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            20,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 1,
+                blocked_until: now,
+                last_seen: now + Duration::from_millis((idx % 1024) as u64),
+            },
+        );
+    }
+
+    let newcomer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40));
+    auth_probe_record_failure_with_state(&state, newcomer, now + Duration::from_millis(1));
+
+    assert!(state.get(&newcomer).is_some(), "newcomer must still be tracked under over-cap pressure");
+    assert!(
+        state.get(&sentinel).is_some(),
+        "high fail-streak sentinel must survive round-limited eviction"
+    );
+    assert!(
+        auth_probe_saturation_is_throttled_at_for_testing(now + Duration::from_millis(1)),
+        "round-limited over-cap path must activate saturation throttle marker"
+    );
+}
+
+#[test]
+fn stress_auth_probe_overcap_churn_does_not_starve_high_threat_sentinel_bucket() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let base_now = Instant::now();
+
+    let sentinel = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 200));
+    state.insert(
+        sentinel,
+        AuthProbeState {
+            fail_streak: 30,
+            blocked_until: base_now,
+            last_seen: base_now - Duration::from_secs(60),
+        },
+    );
+
+    for idx in 0..(AUTH_PROBE_TRACK_MAX_ENTRIES + 80) {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            172,
+            22,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 1,
+                blocked_until: base_now,
+                last_seen: base_now + Duration::from_millis((idx % 2048) as u64),
+            },
+        );
+    }
+
+    for step in 0..512usize {
+        let newcomer = IpAddr::V4(Ipv4Addr::new(
+            203,
+            2,
+            ((step >> 8) & 0xff) as u8,
+            (step & 0xff) as u8,
+        ));
+        auth_probe_record_failure_with_state(&state, newcomer, base_now + Duration::from_millis(step as u64 + 1));
+
+        assert!(
+            state.get(&sentinel).is_some(),
+            "step {step}: high-threat sentinel must not be starved by newcomer churn"
+        );
+        assert!(state.get(&newcomer).is_some(), "step {step}: newcomer must be tracked");
+    }
+}
+
+#[test]
+fn light_fuzz_auth_probe_overcap_eviction_prefers_less_threatening_entries() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let now = Instant::now();
+    let mut s: u64 = 0xBADC_0FFE_EE11_2233;
+
+    for round in 0..128usize {
+        let state = DashMap::new();
+        let sentinel = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 180));
+        state.insert(
+            sentinel,
+            AuthProbeState {
+                fail_streak: 18,
+                blocked_until: now,
+                last_seen: now - Duration::from_secs(5),
+            },
+        );
+
+        for idx in 0..AUTH_PROBE_TRACK_MAX_ENTRIES {
+            s ^= s << 7;
+            s ^= s >> 9;
+            s ^= s << 8;
+            let ip = IpAddr::V4(Ipv4Addr::new(
+                10,
+                ((idx >> 8) & 0xff) as u8,
+                (idx & 0xff) as u8,
+                (s & 0xff) as u8,
+            ));
+            state.insert(
+                ip,
+                AuthProbeState {
+                    fail_streak: 1,
+                    blocked_until: now,
+                    last_seen: now + Duration::from_millis((s & 1023) as u64),
+                },
+            );
+        }
+
+        let newcomer = IpAddr::V4(Ipv4Addr::new(203, 10, ((round >> 8) & 0xff) as u8, (round & 0xff) as u8));
+        auth_probe_record_failure_with_state(&state, newcomer, now + Duration::from_millis(round as u64 + 1));
+
+        assert!(state.get(&newcomer).is_some(), "round {round}: newcomer should be tracked");
+        assert!(
+            state.get(&sentinel).is_some(),
+            "round {round}: high fail-streak sentinel should survive mixed low-threat pool"
+        );
+    }
+}
 #[test]
 fn light_fuzz_auth_probe_eviction_offset_is_deterministic_per_input_pair() {
     let mut rng = StdRng::seed_from_u64(0xA11CE5EED);

@@ -208,6 +208,8 @@ struct StatsIo<S> {
     user: String,
     quota_limit: Option<u64>,
     quota_exceeded: Arc<AtomicBool>,
+    quota_read_wake_scheduled: bool,
+    quota_write_wake_scheduled: bool,
     epoch: Instant,
 }
 
@@ -230,6 +232,8 @@ impl<S> StatsIo<S> {
             user,
             quota_limit,
             quota_exceeded,
+            quota_read_wake_scheduled: false,
+            quota_write_wake_scheduled: false,
             epoch,
         }
     }
@@ -293,9 +297,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
             .then(|| quota_user_lock(&this.user));
         let _quota_guard = if let Some(lock) = quota_lock.as_ref() {
             match lock.try_lock() {
-                Ok(guard) => Some(guard),
+                Ok(guard) => {
+                    this.quota_read_wake_scheduled = false;
+                    Some(guard)
+                }
                 Err(_) => {
-                    cx.waker().wake_by_ref();
+                    if !this.quota_read_wake_scheduled {
+                        this.quota_read_wake_scheduled = true;
+                        let waker = cx.waker().clone();
+                        tokio::task::spawn(async move {
+                            tokio::task::yield_now().await;
+                            waker.wake();
+                        });
+                    }
                     return Poll::Pending;
                 }
             }
@@ -356,9 +370,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
             .then(|| quota_user_lock(&this.user));
         let _quota_guard = if let Some(lock) = quota_lock.as_ref() {
             match lock.try_lock() {
-                Ok(guard) => Some(guard),
+                Ok(guard) => {
+                    this.quota_write_wake_scheduled = false;
+                    Some(guard)
+                }
                 Err(_) => {
-                    cx.waker().wake_by_ref();
+                    if !this.quota_write_wake_scheduled {
+                        this.quota_write_wake_scheduled = true;
+                        let waker = cx.waker().clone();
+                        tokio::task::spawn(async move {
+                            tokio::task::yield_now().await;
+                            waker.wake();
+                        });
+                    }
                     return Poll::Pending;
                 }
             }

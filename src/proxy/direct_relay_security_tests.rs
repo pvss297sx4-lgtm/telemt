@@ -95,6 +95,26 @@ fn unknown_dc_log_fails_closed_when_dedup_lock_is_poisoned() {
 }
 
 #[test]
+fn unsafe_unknown_dc_log_path_does_not_consume_dedup_slot() {
+    let _guard = unknown_dc_test_lock()
+        .lock()
+        .expect("unknown dc test lock must be available");
+    clear_unknown_dc_log_cache_for_testing();
+
+    let dc_idx: i16 = 31_123;
+    let mut cfg = ProxyConfig::default();
+    cfg.general.unknown_dc_file_log_enabled = true;
+    cfg.general.unknown_dc_log_path = Some("../telemt-unknown-dc-unsafe.log".to_string());
+
+    let _ = get_dc_addr_static(dc_idx, &cfg).expect("fallback routing must still work");
+
+    assert!(
+        should_log_unknown_dc(dc_idx),
+        "rejected unsafe log path must not consume unknown-dc dedup entry"
+    );
+}
+
+#[test]
 fn stress_unknown_dc_log_concurrent_unique_churn_respects_cap() {
     let _guard = unknown_dc_test_lock()
         .lock()
@@ -156,6 +176,24 @@ fn light_fuzz_unknown_dc_log_mixed_duplicates_never_exceeds_cap() {
         admitted <= UNKNOWN_DC_LOG_DISTINCT_LIMIT,
         "mixed-duplicate fuzzed inputs must not admit more than cap"
     );
+}
+
+#[test]
+fn scope_hint_accepts_ascii_alnum_and_dash_within_limit() {
+    assert_eq!(validated_scope_hint("scope_alpha-1"), Some("alpha-1"));
+    assert_eq!(validated_scope_hint("scope_AZ09"), Some("AZ09"));
+}
+
+#[test]
+fn scope_hint_rejects_invalid_or_oversized_values() {
+    assert_eq!(validated_scope_hint("plain_user"), None);
+    assert_eq!(validated_scope_hint("scope_"), None);
+    assert_eq!(validated_scope_hint("scope_a/b"), None);
+    assert_eq!(validated_scope_hint("scope_bad space"), None);
+    assert_eq!(validated_scope_hint("scope_bad.dot"), None);
+
+    let oversized = format!("scope_{}", "a".repeat(MAX_SCOPE_HINT_LEN + 1));
+    assert_eq!(validated_scope_hint(&oversized), None);
 }
 
 #[test]
@@ -1206,4 +1244,81 @@ async fn direct_relay_cutover_storm_multi_session_keeps_generic_errors_and_relea
     drop(client_sides);
     tg_accept_task.abort();
     let _ = tg_accept_task.await;
+}
+
+#[test]
+fn prefer_v6_override_matrix_prefers_matching_family_then_degrades_safely() {
+    let dc_idx: i16 = 2;
+
+    let mut cfg_a = ProxyConfig::default();
+    cfg_a.network.prefer = 6;
+    cfg_a.network.ipv6 = Some(true);
+    cfg_a.dc_overrides.insert(
+        dc_idx.to_string(),
+        vec![
+            "203.0.113.90:443".to_string(),
+            "[2001:db8::90]:443".to_string(),
+        ],
+    );
+    let a = get_dc_addr_static(dc_idx, &cfg_a).expect("v6+v4 override set must resolve");
+    assert!(a.is_ipv6(), "prefer_v6 should choose v6 override when present");
+
+    let mut cfg_b = ProxyConfig::default();
+    cfg_b.network.prefer = 6;
+    cfg_b.network.ipv6 = Some(true);
+    cfg_b.dc_overrides
+        .insert(dc_idx.to_string(), vec!["203.0.113.91:443".to_string()]);
+    let b = get_dc_addr_static(dc_idx, &cfg_b).expect("v4-only override must still resolve");
+    assert!(b.is_ipv4(), "when no v6 override exists, v4 override must be used");
+
+    let mut cfg_c = ProxyConfig::default();
+    cfg_c.network.prefer = 6;
+    cfg_c.network.ipv6 = Some(true);
+    let c = get_dc_addr_static(dc_idx, &cfg_c).expect("table fallback must resolve");
+    assert_eq!(
+        c,
+        SocketAddr::new(TG_DATACENTERS_V6[(dc_idx as usize) - 1], TG_DATACENTER_PORT),
+        "without overrides, prefer_v6 path must resolve from static v6 datacenter table"
+    );
+}
+
+#[test]
+fn prefer_v6_override_matrix_ignores_invalid_entries_and_keeps_fail_closed_fallback() {
+    let dc_idx: i16 = 3;
+
+    let mut cfg = ProxyConfig::default();
+    cfg.network.prefer = 6;
+    cfg.network.ipv6 = Some(true);
+    cfg.dc_overrides.insert(
+        dc_idx.to_string(),
+        vec![
+            "not-an-addr".to_string(),
+            "also:bad".to_string(),
+            "203.0.113.55:443".to_string(),
+        ],
+    );
+
+    let addr = get_dc_addr_static(dc_idx, &cfg).expect("at least one valid override must keep resolution alive");
+    assert_eq!(addr, "203.0.113.55:443".parse::<SocketAddr>().unwrap());
+}
+
+#[test]
+fn stress_prefer_v6_override_matrix_is_deterministic_under_mixed_inputs() {
+    for idx in 1..=5i16 {
+        let mut cfg = ProxyConfig::default();
+        cfg.network.prefer = 6;
+        cfg.network.ipv6 = Some(true);
+        cfg.dc_overrides.insert(
+            idx.to_string(),
+            vec![
+                format!("203.0.113.{}:443", 100 + idx),
+                format!("[2001:db8::{}]:443", 100 + idx),
+            ],
+        );
+
+        let first = get_dc_addr_static(idx, &cfg).expect("first lookup must resolve");
+        let second = get_dc_addr_static(idx, &cfg).expect("second lookup must resolve");
+        assert_eq!(first, second, "override resolution must stay deterministic for dc {idx}");
+        assert!(first.is_ipv6(), "dc {idx}: v6 override should be preferred");
+    }
 }

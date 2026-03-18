@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn, trace};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{sha256, AesCtr, SecureRandom};
 use rand::Rng;
@@ -28,6 +28,10 @@ use crate::tls_front::{TlsFrontCache, emulator};
 
 const ACCESS_SECRET_BYTES: usize = 16;
 static INVALID_SECRET_WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+#[cfg(test)]
+const WARNED_SECRET_MAX_ENTRIES: usize = 64;
+#[cfg(not(test))]
+const WARNED_SECRET_MAX_ENTRIES: usize = 1_024;
 
 const AUTH_PROBE_TRACK_RETENTION_SECS: u64 = 10 * 60;
 #[cfg(test)]
@@ -406,7 +410,13 @@ fn warn_invalid_secret_once(name: &str, reason: &str, expected: usize, got: Opti
     let key = (name.to_string(), reason.to_string());
     let warned = INVALID_SECRET_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
     let should_warn = match warned.lock() {
-        Ok(mut guard) => guard.insert(key),
+        Ok(mut guard) => {
+            if !guard.contains(&key) && guard.len() >= WARNED_SECRET_MAX_ENTRIES {
+                false
+            } else {
+                guard.insert(key)
+            }
+        }
         Err(_) => true,
     };
 
@@ -575,6 +585,7 @@ where
     }
 
     if handshake.len() < tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN + 1 {
+        auth_probe_record_failure(peer.ip(), Instant::now());
         maybe_apply_server_hello_delay(config).await;
         debug!(peer = %peer, "TLS handshake too short");
         return HandshakeResult::BadClient { reader, writer };
@@ -736,9 +747,13 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    let handshake_fingerprint = {
+        let digest = sha256(&handshake[..8]);
+        hex::encode(&digest[..4])
+    };
     trace!(
         peer = %peer,
-        handshake_head = %hex::encode(&handshake[..8]),
+        handshake_fingerprint = %handshake_fingerprint,
         "MTProto handshake prefix"
     );
 
@@ -760,7 +775,7 @@ where
         let dec_prekey = &dec_prekey_iv[..PREKEY_LEN];
         let dec_iv_bytes = &dec_prekey_iv[PREKEY_LEN..];
 
-        let mut dec_key_input = Vec::with_capacity(PREKEY_LEN + secret.len());
+        let mut dec_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
         dec_key_input.extend_from_slice(dec_prekey);
         dec_key_input.extend_from_slice(&secret);
         let dec_key = sha256(&dec_key_input);
@@ -796,7 +811,7 @@ where
         let enc_prekey = &enc_prekey_iv[..PREKEY_LEN];
         let enc_iv_bytes = &enc_prekey_iv[PREKEY_LEN..];
 
-        let mut enc_key_input = Vec::with_capacity(PREKEY_LEN + secret.len());
+        let mut enc_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
         enc_key_input.extend_from_slice(enc_prekey);
         enc_key_input.extend_from_slice(&secret);
         let enc_key = sha256(&enc_key_input);
@@ -885,7 +900,7 @@ pub fn generate_tg_nonce(
         nonce[DC_IDX_POS..DC_IDX_POS + 2].copy_from_slice(&dc_idx.to_le_bytes());
 
         if fast_mode {
-            let mut key_iv = Vec::with_capacity(KEY_LEN + IV_LEN);
+            let mut key_iv = Zeroizing::new(Vec::with_capacity(KEY_LEN + IV_LEN));
             key_iv.extend_from_slice(client_enc_key);
             key_iv.extend_from_slice(&client_enc_iv.to_be_bytes());
             key_iv.reverse(); // Python/C behavior: reversed enc_key+enc_iv in nonce
@@ -893,7 +908,7 @@ pub fn generate_tg_nonce(
         }
 
         let enc_key_iv = &nonce[SKIP_LEN..SKIP_LEN + KEY_LEN + IV_LEN];
-        let dec_key_iv: Vec<u8> = enc_key_iv.iter().rev().copied().collect();
+        let dec_key_iv = Zeroizing::new(enc_key_iv.iter().rev().copied().collect::<Vec<u8>>());
 
         let mut tg_enc_key = [0u8; 32];
         tg_enc_key.copy_from_slice(&enc_key_iv[..KEY_LEN]);
@@ -914,7 +929,7 @@ pub fn generate_tg_nonce(
 /// Encrypt nonce for sending to Telegram and return cipher objects with correct counter state
 pub fn encrypt_tg_nonce_with_ciphers(nonce: &[u8; HANDSHAKE_LEN]) -> (Vec<u8>, AesCtr, AesCtr) {
     let enc_key_iv = &nonce[SKIP_LEN..SKIP_LEN + KEY_LEN + IV_LEN];
-    let dec_key_iv: Vec<u8> = enc_key_iv.iter().rev().copied().collect();
+    let dec_key_iv = Zeroizing::new(enc_key_iv.iter().rev().copied().collect::<Vec<u8>>());
 
     let mut enc_key = [0u8; 32];
     enc_key.copy_from_slice(&enc_key_iv[..KEY_LEN]);
@@ -935,6 +950,8 @@ pub fn encrypt_tg_nonce_with_ciphers(nonce: &[u8; HANDSHAKE_LEN]) -> (Vec<u8>, A
     result.extend_from_slice(&encrypted_full[PROTO_TAG_POS..]);
 
     let decryptor = AesCtr::new(&dec_key, dec_iv);
+    enc_key.zeroize();
+    dec_key.zeroize();
 
     (result, encryptor, decryptor)
 }
@@ -949,6 +966,10 @@ pub fn encrypt_tg_nonce(nonce: &[u8; HANDSHAKE_LEN]) -> Vec<u8> {
 #[cfg(test)]
 #[path = "handshake_security_tests.rs"]
 mod security_tests;
+
+#[cfg(test)]
+#[path = "handshake_gap_short_tls_probe_throttle_security_tests.rs"]
+mod gap_short_tls_probe_throttle_security_tests;
 
 /// Compile-time guard: HandshakeSuccess holds cryptographic key material and
 /// must never be Copy.  A Copy impl would allow silent key duplication,

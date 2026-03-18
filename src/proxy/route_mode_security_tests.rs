@@ -338,3 +338,69 @@ fn light_fuzz_cutover_stagger_delay_distribution_stays_in_fixed_window() {
         );
     }
 }
+
+#[test]
+fn cutover_stagger_delay_distribution_has_no_empty_buckets_under_sequential_sessions() {
+    let mut buckets = [0usize; 1000];
+    let generation = 4242u64;
+
+    for session_id in 0..250_000u64 {
+        let delay_ms = cutover_stagger_delay(session_id, generation).as_millis() as usize;
+        let idx = delay_ms - 1000;
+        buckets[idx] += 1;
+    }
+
+    let empty = buckets.iter().filter(|&&count| count == 0).count();
+    assert_eq!(
+        empty, 0,
+        "all 1000 delay buckets must be exercised to avoid cutover herd clustering"
+    );
+}
+
+#[test]
+fn light_fuzz_cutover_stagger_delay_distribution_stays_reasonably_uniform() {
+    let mut buckets = [0usize; 1000];
+    let mut s: u64 = 0x1BAD_B002_CAFE_F00D;
+
+    for _ in 0..300_000usize {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+        let session_id = s;
+
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+        let generation = s;
+
+        let delay_ms = cutover_stagger_delay(session_id, generation).as_millis() as usize;
+        buckets[delay_ms - 1000] += 1;
+    }
+
+    let min = *buckets.iter().min().unwrap_or(&0);
+    let max = *buckets.iter().max().unwrap_or(&0);
+    assert!(min > 0, "fuzzed distribution must not leave empty buckets");
+    assert!(
+        max <= min.saturating_mul(3),
+        "bucket skew is too high for anti-herd staggering (max={max}, min={min})"
+    );
+}
+
+#[test]
+fn stress_cutover_stagger_delay_distribution_remains_stable_across_generations() {
+    for generation in [0u64, 1, 7, 31, 255, 1024, u32::MAX as u64, u64::MAX - 1] {
+        let mut buckets = [0usize; 1000];
+        for session_id in 0..100_000u64 {
+            let delay_ms = cutover_stagger_delay(session_id ^ 0x9E37_79B9, generation)
+                .as_millis() as usize;
+            buckets[delay_ms - 1000] += 1;
+        }
+
+        let min = *buckets.iter().min().unwrap_or(&0);
+        let max = *buckets.iter().max().unwrap_or(&0);
+        assert!(
+            max <= min.saturating_mul(4).max(1),
+            "generation={generation}: distribution collapsed (max={max}, min={min})"
+        );
+    }
+}
