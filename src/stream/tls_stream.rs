@@ -250,6 +250,14 @@ impl<R> FakeTlsReader<R> {
     pub fn get_mut(&mut self) -> &mut R { &mut self.upstream }
     pub fn into_inner(self) -> R { self.upstream }
 
+    pub fn into_inner_with_pending_plaintext(mut self) -> (R, Vec<u8>) {
+        let pending = match std::mem::replace(&mut self.state, TlsReaderState::Idle) {
+            TlsReaderState::Yielding { buffer } => buffer.as_slice().to_vec(),
+            _ => Vec::new(),
+        };
+        (self.upstream, pending)
+    }
+
     pub fn is_poisoned(&self) -> bool { self.state.is_poisoned() }
     pub fn state_name(&self) -> &'static str { self.state.state_name() }
 

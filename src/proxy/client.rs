@@ -101,6 +101,15 @@ fn beobachten_ttl(config: &ProxyConfig) -> Duration {
     Duration::from_secs(minutes.saturating_mul(60))
 }
 
+fn wrap_tls_application_record(payload: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(5 + payload.len());
+    record.push(TLS_RECORD_APPLICATION);
+    record.extend_from_slice(&TLS_VERSION);
+    record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    record.extend_from_slice(payload);
+    record
+}
+
 fn record_beobachten_class(
     beobachten: &BeobachtenStore,
     config: &ProxyConfig,
@@ -298,8 +307,14 @@ where
                     // MTProto failed after TLS ServerHello was already sent.
                     // Switch fallback relay back to raw transport so the mask
                     // backend receives valid TLS records (not unwrapped payload).
-                    let reader = reader.into_inner();
+                    let (reader, pending_plaintext) = reader.into_inner_with_pending_plaintext();
                     let writer = writer.into_inner();
+                    let pending_record = if pending_plaintext.is_empty() {
+                        Vec::new()
+                    } else {
+                        wrap_tls_application_record(&pending_plaintext)
+                    };
+                    let reader = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(pending_record), reader);
                     stats.increment_connects_bad();
                     debug!(
                         peer = %peer,
@@ -719,8 +734,14 @@ impl RunningClientHandler {
                 // MTProto failed after TLS ServerHello was already sent.
                 // Switch fallback relay back to raw transport so the mask
                 // backend receives valid TLS records (not unwrapped payload).
-                let reader = reader.into_inner();
+                let (reader, pending_plaintext) = reader.into_inner_with_pending_plaintext();
                 let writer = writer.into_inner();
+                let pending_record = if pending_plaintext.is_empty() {
+                    Vec::new()
+                } else {
+                    wrap_tls_application_record(&pending_plaintext)
+                };
+                let reader = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(pending_record), reader);
                 stats.increment_connects_bad();
                 debug!(
                     peer = %peer,
