@@ -21,7 +21,7 @@ use crate::proxy::route_mode::{
     ROUTE_SWITCH_ERROR_MSG, RelayRouteMode, RouteCutoverState, affected_cutover_state,
     cutover_stagger_delay,
 };
-use crate::stats::Stats;
+use crate::stats::{MeD2cFlushReason, MeD2cQuotaRejectStage, MeD2cWriteMode, Stats};
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter, PooledBuffer};
 use crate::transport::middle_proxy::{MePool, MeResponse, proto_flags_for_tag};
 
@@ -574,6 +574,49 @@ fn quota_would_be_exceeded_for_user_soft(
     })
 }
 
+fn classify_me_d2c_flush_reason(
+    flush_immediately: bool,
+    batch_frames: usize,
+    max_frames: usize,
+    batch_bytes: usize,
+    max_bytes: usize,
+    max_delay_fired: bool,
+) -> MeD2cFlushReason {
+    if flush_immediately {
+        return MeD2cFlushReason::AckImmediate;
+    }
+    if batch_frames >= max_frames {
+        return MeD2cFlushReason::BatchFrames;
+    }
+    if batch_bytes >= max_bytes {
+        return MeD2cFlushReason::BatchBytes;
+    }
+    if max_delay_fired {
+        return MeD2cFlushReason::MaxDelay;
+    }
+    MeD2cFlushReason::QueueDrain
+}
+
+fn observe_me_d2c_flush_event(
+    stats: &Stats,
+    reason: MeD2cFlushReason,
+    batch_frames: usize,
+    batch_bytes: usize,
+    flush_duration_us: Option<u64>,
+) {
+    stats.increment_me_d2c_flush_reason(reason);
+    if batch_frames > 0 || batch_bytes > 0 {
+        stats.increment_me_d2c_batches_total();
+        stats.add_me_d2c_batch_frames_total(batch_frames as u64);
+        stats.add_me_d2c_batch_bytes_total(batch_bytes as u64);
+        stats.observe_me_d2c_batch_frames(batch_frames as u64);
+        stats.observe_me_d2c_batch_bytes(batch_bytes as u64);
+    }
+    if let Some(duration_us) = flush_duration_us {
+        stats.observe_me_d2c_flush_duration_us(duration_us);
+    }
+}
+
 #[cfg(test)]
 fn quota_user_lock_test_guard() -> &'static Mutex<()> {
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -810,6 +853,7 @@ where
                     let mut batch_frames = 0usize;
                     let mut batch_bytes = 0usize;
                     let mut flush_immediately;
+                    let mut max_delay_fired = false;
 
                     let first_is_downstream_activity =
                         matches!(&first, MeResponse::Data { .. } | MeResponse::Ack(_));
@@ -838,7 +882,25 @@ where
                             flush_immediately = immediate;
                         }
                         MeWriterResponseOutcome::Close => {
+                            let flush_started_at = if stats_clone.telemetry_policy().me_level.allows_debug() {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
                             let _ = writer.flush().await;
+                            let flush_duration_us = flush_started_at.map(|started| {
+                                started
+                                    .elapsed()
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64
+                            });
+                            observe_me_d2c_flush_event(
+                                stats_clone.as_ref(),
+                                MeD2cFlushReason::Close,
+                                batch_frames,
+                                batch_bytes,
+                                flush_duration_us,
+                            );
                             return Ok(());
                         }
                     }
@@ -878,7 +940,27 @@ where
                                 flush_immediately |= immediate;
                             }
                             MeWriterResponseOutcome::Close => {
+                                let flush_started_at =
+                                    if stats_clone.telemetry_policy().me_level.allows_debug() {
+                                        Some(Instant::now())
+                                    } else {
+                                        None
+                                    };
                                 let _ = writer.flush().await;
+                                let flush_duration_us = flush_started_at.map(|started| {
+                                    started
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX))
+                                        as u64
+                                });
+                                observe_me_d2c_flush_event(
+                                    stats_clone.as_ref(),
+                                    MeD2cFlushReason::Close,
+                                    batch_frames,
+                                    batch_bytes,
+                                    flush_duration_us,
+                                );
                                 return Ok(());
                             }
                         }
@@ -889,6 +971,7 @@ where
                         && batch_frames < d2c_flush_policy.max_frames
                         && batch_bytes < d2c_flush_policy.max_bytes
                     {
+                        stats_clone.increment_me_d2c_batch_timeout_armed_total();
                         match tokio::time::timeout(d2c_flush_policy.max_delay, me_rx_task.recv()).await {
                             Ok(Some(next)) => {
                                 let next_is_downstream_activity =
@@ -918,7 +1001,30 @@ where
                                         flush_immediately |= immediate;
                                     }
                                     MeWriterResponseOutcome::Close => {
+                                        let flush_started_at = if stats_clone
+                                            .telemetry_policy()
+                                            .me_level
+                                            .allows_debug()
+                                        {
+                                            Some(Instant::now())
+                                        } else {
+                                            None
+                                        };
                                         let _ = writer.flush().await;
+                                        let flush_duration_us = flush_started_at.map(|started| {
+                                            started
+                                                .elapsed()
+                                                .as_micros()
+                                                .min(u128::from(u64::MAX))
+                                                as u64
+                                        });
+                                        observe_me_d2c_flush_event(
+                                            stats_clone.as_ref(),
+                                            MeD2cFlushReason::Close,
+                                            batch_frames,
+                                            batch_bytes,
+                                            flush_duration_us,
+                                        );
                                         return Ok(());
                                     }
                                 }
@@ -958,7 +1064,30 @@ where
                                             flush_immediately |= immediate;
                                         }
                                         MeWriterResponseOutcome::Close => {
+                                            let flush_started_at = if stats_clone
+                                                .telemetry_policy()
+                                                .me_level
+                                                .allows_debug()
+                                            {
+                                                Some(Instant::now())
+                                            } else {
+                                                None
+                                            };
                                             let _ = writer.flush().await;
+                                            let flush_duration_us = flush_started_at.map(|started| {
+                                                started
+                                                    .elapsed()
+                                                    .as_micros()
+                                                    .min(u128::from(u64::MAX))
+                                                    as u64
+                                            });
+                                            observe_me_d2c_flush_event(
+                                                stats_clone.as_ref(),
+                                                MeD2cFlushReason::Close,
+                                                batch_frames,
+                                                batch_bytes,
+                                                flush_duration_us,
+                                            );
                                             return Ok(());
                                         }
                                     }
@@ -968,16 +1097,49 @@ where
                                 debug!(conn_id, "ME channel closed");
                                 return Err(ProxyError::Proxy("ME connection lost".into()));
                             }
-                            Err(_) => {}
+                            Err(_) => {
+                                max_delay_fired = true;
+                                stats_clone.increment_me_d2c_batch_timeout_fired_total();
+                            }
                         }
                     }
 
+                    let flush_reason = classify_me_d2c_flush_reason(
+                        flush_immediately,
+                        batch_frames,
+                        d2c_flush_policy.max_frames,
+                        batch_bytes,
+                        d2c_flush_policy.max_bytes,
+                        max_delay_fired,
+                    );
+                    let flush_started_at = if stats_clone.telemetry_policy().me_level.allows_debug() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     writer.flush().await.map_err(ProxyError::Io)?;
+                    let flush_duration_us = flush_started_at.map(|started| {
+                        started
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64
+                    });
+                    observe_me_d2c_flush_event(
+                        stats_clone.as_ref(),
+                        flush_reason,
+                        batch_frames,
+                        batch_bytes,
+                        flush_duration_us,
+                    );
                     let shrink_threshold = d2c_flush_policy.frame_buf_shrink_threshold_bytes;
                     let shrink_trigger = shrink_threshold
                         .saturating_mul(ME_D2C_FRAME_BUF_SHRINK_HYSTERESIS_FACTOR);
                     if frame_buf.capacity() > shrink_trigger {
+                        let cap_before = frame_buf.capacity();
                         frame_buf.shrink_to(shrink_threshold);
+                        let cap_after = frame_buf.capacity();
+                        let bytes_freed = cap_before.saturating_sub(cap_after) as u64;
+                        stats_clone.observe_me_d2c_frame_buf_shrink(bytes_freed);
                     }
                 }
                 _ = &mut stop_rx => {
@@ -1552,15 +1714,21 @@ where
                 data_len,
                 quota_soft_overshoot_bytes,
             ) {
+                stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
                 return Err(ProxyError::DataQuotaExceeded {
                     user: user.to_string(),
                 });
             }
 
-            write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf).await?;
+            let write_mode =
+                write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf)
+                    .await?;
+            stats.increment_me_d2c_write_mode(write_mode);
 
             bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
             stats.add_user_octets_to(user, data.len() as u64);
+            stats.increment_me_d2c_data_frames_total();
+            stats.add_me_d2c_payload_bytes_total(data.len() as u64);
 
             if quota_exceeded_for_user_soft(
                 stats,
@@ -1568,6 +1736,7 @@ where
                 quota_limit,
                 quota_soft_overshoot_bytes,
             ) {
+                stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PostWrite);
                 return Err(ProxyError::DataQuotaExceeded {
                     user: user.to_string(),
                 });
@@ -1586,6 +1755,7 @@ where
                 trace!(conn_id, confirm, "ME->C quickack");
             }
             write_client_ack(client_writer, proto_tag, confirm).await?;
+            stats.increment_me_d2c_ack_frames_total();
 
             Ok(MeWriterResponseOutcome::Continue {
                 frames: 1,
@@ -1636,13 +1806,13 @@ async fn write_client_payload<W>(
     data: &[u8],
     rng: &SecureRandom,
     frame_buf: &mut Vec<u8>,
-) -> Result<()>
+) -> Result<MeD2cWriteMode>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let quickack = (flags & RPC_FLAG_QUICKACK) != 0;
 
-    match proto_tag {
+    let write_mode = match proto_tag {
         ProtoTag::Abridged => {
             if !data.len().is_multiple_of(4) {
                 return Err(ProxyError::Proxy(format!(
@@ -1667,10 +1837,12 @@ where
                         .write_all(frame_buf.as_slice())
                         .await
                         .map_err(ProxyError::Io)?;
+                    MeD2cWriteMode::Coalesced
                 } else {
                     let header = [first];
                     client_writer.write_all(&header).await.map_err(ProxyError::Io)?;
                     client_writer.write_all(data).await.map_err(ProxyError::Io)?;
+                    MeD2cWriteMode::Split
                 }
             } else if len_words < (1 << 24) {
                 let mut first = 0x7fu8;
@@ -1688,10 +1860,12 @@ where
                         .write_all(frame_buf.as_slice())
                         .await
                         .map_err(ProxyError::Io)?;
+                    MeD2cWriteMode::Coalesced
                 } else {
                     let header = [first, lw[0], lw[1], lw[2]];
                     client_writer.write_all(&header).await.map_err(ProxyError::Io)?;
                     client_writer.write_all(data).await.map_err(ProxyError::Io)?;
+                    MeD2cWriteMode::Split
                 }
             } else {
                 return Err(ProxyError::Proxy(format!(
@@ -1729,6 +1903,7 @@ where
                     .write_all(frame_buf.as_slice())
                     .await
                     .map_err(ProxyError::Io)?;
+                MeD2cWriteMode::Coalesced
             } else {
                 let header = len_val.to_le_bytes();
                 client_writer.write_all(&header).await.map_err(ProxyError::Io)?;
@@ -1745,11 +1920,12 @@ where
                         .await
                         .map_err(ProxyError::Io)?;
                 }
+                MeD2cWriteMode::Split
             }
         }
-    }
+    };
 
-    Ok(())
+    Ok(write_mode)
 }
 
 async fn write_client_ack<W>(
