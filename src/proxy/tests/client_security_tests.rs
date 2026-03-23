@@ -242,6 +242,11 @@ where
     CryptoWriter::new(writer, AesCtr::new(&key, iv), 8 * 1024)
 }
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[tokio::test]
 async fn user_connection_reservation_drop_enqueues_cleanup_synchronously() {
     let ip_tracker = Arc::new(crate::ip_tracker::UserIpTracker::new());
@@ -3040,7 +3045,7 @@ async fn quota_rejection_does_not_reserve_ip_or_trigger_rollback() {
         .insert("user".to_string(), 1024);
 
     let stats = Stats::new();
-    stats.add_user_octets_from("user", 1024);
+    preload_user_quota(&stats, "user", 1024);
 
     let ip_tracker = UserIpTracker::new();
     let peer_addr: SocketAddr = "203.0.113.211:50001".parse().unwrap();

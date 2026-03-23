@@ -6,6 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[tokio::test]
 async fn edge_mask_delay_bypassed_if_max_is_zero() {
     let mut config = ProxyConfig::default();
@@ -42,7 +47,7 @@ async fn boundary_user_data_quota_exact_match_rejects() {
     config.access.user_data_quota.insert(user.to_string(), 1024);
 
     let stats = Arc::new(Stats::new());
-    stats.add_user_octets_from(user, 1024);
+    preload_user_quota(stats.as_ref(), user, 1024);
 
     let ip_tracker = Arc::new(UserIpTracker::new());
     let peer = "198.51.100.10:55000".parse().unwrap();

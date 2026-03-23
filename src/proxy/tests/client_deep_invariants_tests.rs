@@ -7,6 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, duplex};
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[test]
 fn invariant_wrap_tls_application_record_exact_multiples() {
     let chunk_size = u16::MAX as usize;
@@ -114,7 +119,7 @@ async fn invariant_quota_exact_boundary_inclusive() {
     let ip_tracker = Arc::new(UserIpTracker::new());
     let peer = "198.51.100.23:55000".parse().unwrap();
 
-    stats.add_user_octets_from(user, 999);
+    preload_user_quota(stats.as_ref(), user, 999);
     let res1 = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
         &config,
@@ -126,7 +131,7 @@ async fn invariant_quota_exact_boundary_inclusive() {
     assert!(res1.is_ok());
     res1.unwrap().release().await;
 
-    stats.add_user_octets_from(user, 1);
+    preload_user_quota(stats.as_ref(), user, 1);
     let res2 = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
         &config,

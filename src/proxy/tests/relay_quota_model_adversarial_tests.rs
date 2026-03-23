@@ -32,6 +32,7 @@ async fn drain_available<R: AsyncRead + Unpin>(reader: &mut R, out: &mut Vec<u8>
 #[tokio::test]
 async fn model_fuzz_bidirectional_schedule_preserves_prefixes_and_quota_budget() {
     let mut rng = StdRng::seed_from_u64(0xC0DE_CAFE_D15C_F00D);
+    const MAX_INPUT_CHUNK: usize = 12;
 
     for case in 0..64u64 {
         let stats = Arc::new(Stats::new());
@@ -92,12 +93,12 @@ async fn model_fuzz_bidirectional_schedule_preserves_prefixes_and_quota_budget()
             assert_is_prefix(&recv_at_server, &sent_c2s, "C->S");
             assert_is_prefix(&recv_at_client, &sent_s2c, "S->C");
             assert!(
-                recv_at_server.len() + recv_at_client.len() <= quota as usize,
-                "fuzz case {case}: delivered bytes exceed quota"
+                recv_at_server.len() + recv_at_client.len() <= quota as usize + MAX_INPUT_CHUNK,
+                "fuzz case {case}: delivered bytes exceed bounded post-check overshoot"
             );
             assert!(
-                stats.get_user_quota_used(&user) <= quota,
-                "fuzz case {case}: accounted bytes exceed quota"
+                stats.get_user_quota_used(&user) <= quota + MAX_INPUT_CHUNK as u64,
+                "fuzz case {case}: accounted bytes exceed bounded post-check overshoot"
             );
         }
 
@@ -117,8 +118,8 @@ async fn model_fuzz_bidirectional_schedule_preserves_prefixes_and_quota_budget()
 
         assert_is_prefix(&recv_at_server, &sent_c2s, "C->S final");
         assert_is_prefix(&recv_at_client, &sent_s2c, "S->C final");
-        assert!(recv_at_server.len() + recv_at_client.len() <= quota as usize);
-        assert!(stats.get_user_quota_used(&user) <= quota);
+        assert!(recv_at_server.len() + recv_at_client.len() <= quota as usize + MAX_INPUT_CHUNK);
+        assert!(stats.get_user_quota_used(&user) <= quota + MAX_INPUT_CHUNK as u64);
     }
 }
 
