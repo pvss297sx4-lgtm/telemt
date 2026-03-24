@@ -34,7 +34,7 @@ jobs:
       - run: cargo fmt -- --check
 
 # ==========================
-# Test
+# Tests
 # ==========================
   test:
     name: Test
@@ -99,7 +99,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - run: cargo clippy -j $(nproc) -- --cap-lints warn
+      - run: cargo clippy -- --cap-lints warn
 
 # ==========================
 # Udeps
@@ -130,4 +130,5 @@ jobs:
       - name: Install cargo-udeps
         run: cargo install cargo-udeps || true
 
+      # тоже не валит билд
       - run: cargo udeps || true
