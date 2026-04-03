@@ -3,6 +3,9 @@
 ***Löst Probleme, bevor andere überhaupt wissen, dass sie existieren*** / ***It solves problems before others even realize they exist***
 
 ### [**Telemt Chat in Telegram**](https://t.me/telemtrs)
+#### Fixed TLS ClientHello is now available in Telegram Desktop starting from version 6.7.2: to work with EE-MTProxy, please update your client;
+#### Fixed TLS ClientHello for Telegram Android Client is available in [our chat](https://t.me/telemtrs/30234/36441); official releases for Android and iOS are "work in progress";
+
 
 **Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as:
 - [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + Generation Lifecycle](https://github.com/telemt/telemt/blob/main/docs/model/MODEL.en.md)
