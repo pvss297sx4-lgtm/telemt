@@ -15,8 +15,8 @@
 </p>
 
 **Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as:
-- [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + Generation Lifecycle](https://github.com/telemt/telemt/blob/main/docs/model/MODEL.en.md);
-- [Full-covered API w/ management](https://github.com/telemt/telemt/blob/main/docs/API.md);
+- [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + Generation Lifecycle](https://github.com/telemt/telemt/blob/main/docs/Architecture/Model/MODEL.en.md);
+- [Full-covered API w/ management](https://github.com/telemt/telemt/blob/main/docs/Architecture/API/API.md);
 - Anti-Replay on Sliding Window;
 - Prometheus-format Metrics;
 - TLS-Fronting and TCP-Splicing for masking from "prying" eyes.
