@@ -1,4 +1,20 @@
-# Telemt через Systemd
+# Очень быстрый старт
+
+### Установка одной командой / обновление при повторном запуске
+```bash
+curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh
+```
+### Установка нужной версии
+```bash
+curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh -s -- 3.3.39
+```
+
+### Удаление с полной очисткой
+```bash
+curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh -s -- purge
+```
+
+# Telemt через Systemd вручную
 
 ## Установка
 
