@@ -104,9 +104,8 @@ For massive traffic loads, buffering Telemt behind a reverse proxy like HAProxy 
 global
     # Disable detailed logging under load
     log stdout format raw local0 err
-    maxconn 250000
-    # Threading optimizations (explicitly use all cores)
-    nbthread auto
+    # maxconn 250000
+    
     # Buffer tuning
     tune.bufsize 16384
     tune.maxaccept 64

@@ -104,8 +104,6 @@ global
     # Отключить детальные логи соединений под нагрузкой
     log stdout format raw local0 err
     maxconn 250000
-    # Использовать все ядра CPU
-    nbthread auto
     # Тюнинг буферов и приема сокетов
     tune.bufsize 16384
     tune.maxaccept 64
